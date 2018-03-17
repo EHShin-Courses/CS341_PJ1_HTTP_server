@@ -22,6 +22,76 @@ void *get_in_addr(struct sockaddr *sa){
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+int build_http_request(char ** message, int *size, char * method, char * path, char * host, char * port, char * body){
+    
+    *size = strlen(path)+strlen(body)+100; //rough size estimate
+    char * buffer = (char *)malloc(*size);
+    char * tbuf = (char *)malloc(64);
+    int tlen;
+    *message = buffer;
+    int idx = 0;
+
+    //method
+    if(strncmp(method, "-G", 2) == 0){
+        strncpy(buffer+idx, "GET", 3);
+        idx += 3;
+    }
+    else if(strncmp(method, "-P", 2) == 0){
+        strncpy(buffer+idx, "POST", 4);
+        idx += 4;
+    }
+    else{
+        printf("build http request : method error\n");
+        return -1;
+    }
+    buffer[idx++] = ' ';
+
+    //url
+    tlen = strlen(path);
+    strncpy(buffer+idx, path, tlen);
+    idx += tlen;
+    buffer[idx++] = ' ';
+
+    //version
+    tbuf = "HTTP/1.0\r\n";
+    tlen = strlen(tbuf);
+    strncpy(buffer+idx, tbuf, tlen);
+    idx += tlen;
+
+    //<headers>
+
+    //Host
+    tbuf = "Host: ";
+    tlen = strlen(tbuf);
+    strncpy(buffer+idx, tbuf, tlen);
+    idx += tlen;
+
+    tlen = strlen(host);
+    strncpy(buffer+idx, host, tlen);
+    idx += tlen;
+
+    buffer[idx++] = ':';
+
+    tlen = strlen(port);
+    strncpy(buffer+idx, port, tlen);
+    idx += tlen;
+
+    buffer[idx++] = '\r';
+    buffer[idx++] = '\n';
+
+    //End of headers 
+    buffer[idx++] = '\r';
+    buffer[idx++] = '\n';
+
+    //just to be safe
+    buffer[idx] = '\0';
+
+    *size = idx;
+
+    return 0;
+}
+
+
 int parse_url(const char * url, char ** hostname, char ** port, char ** path){
     int hname_idx;
     int port_idx;
@@ -81,36 +151,39 @@ int main(int argc, char * argv[]){
     char buf[MAXDATASIZE];
     struct addrinfo hints, *servinfo, *p;
     int rv;
+ 
     char s[INET6_ADDRSTRLEN];
+    char * hostname;
+    char * port;
+    char * path;
+
+    char * message;
+    int msize;
 
     if(argc != 3){
         fprintf(stderr, "usage: ./client -[G|P] url\n");
         exit(1);
     }
 
-    char * hostname;
-    char * port;
-    char * path;
-
     //parse url
     if(parse_url(argv[2], &hostname, &port, &path) == -1){
         printf("Incorrect URL: %s\n", argv[2]);
-    }
-    
-    //printf("%s\n%s\n%s\n", hostname, port, path);
-
+        exit(1);
+    } 
 
     //build HTTP request
+    if(build_http_request(&message, &msize, argv[1], path, hostname, port, "") == -1){
+        printf("HTTP request build error\n");
+        exit(1);
+    }
 
-
-    return 0;
-
+    printf("message:\n%s\n", message);
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if((rv = getaddrinfo(argv[1], PORT, &hints, &servinfo)) != 0){
+    if((rv = getaddrinfo(hostname, port, &hints, &servinfo)) != 0){
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
         return 1;
     }
@@ -138,14 +211,16 @@ int main(int argc, char * argv[]){
 
     printf("client: connecting to %s\n", s);
     freeaddrinfo(servinfo);
-    strncpy(buf, "Hello there!", sizeof(buf));
-    if(send(sockfd, buf, MAXDATASIZE, 0) == -1){
+    //strncpy(buf, "Hello there!", sizeof(buf));
+    if(send(sockfd, message, msize, 0) == -1){
         perror("send");
     }
+
     if((numbytes = recv(sockfd, buf, MAXDATASIZE-1, 0)) == -1){
         perror("recv");
         exit(1);
     }
+
     buf[numbytes] = '\0';
     printf("Data from server: %s\n", buf);
     close(sockfd);
