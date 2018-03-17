@@ -13,7 +13,7 @@
 
 #define PORT "9034"
 
-#define MAXDATASIZE 100
+#define CHUNKSIZE 100
 
 void *get_in_addr(struct sockaddr *sa){
     if(sa->sa_family == AF_INET){
@@ -22,21 +22,22 @@ void *get_in_addr(struct sockaddr *sa){
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int build_http_request(char ** message, int *size, char * method, char * path, char * host, char * port, char * body){
+int build_http_request(char ** message, int *size, char * method, char * path, char * host, char * port, int clength){
     
-    *size = strlen(path)+strlen(body)+100; //rough size estimate
+    *size = 100+strlen(path); //rough size estimate
     char * buffer = (char *)malloc(*size);
-    char * tbuf = (char *)malloc(64);
+    char * tbuf;
+    char sbuf[64];
     int tlen;
     *message = buffer;
     int idx = 0;
 
     //method
-    if(strncmp(method, "-G", 2) == 0){
+    if(strncmp(method, "-G", 2) == 0 || strncmp(method, "-g", 2) == 0){
         strncpy(buffer+idx, "GET", 3);
         idx += 3;
     }
-    else if(strncmp(method, "-P", 2) == 0){
+    else if(strncmp(method, "-P", 2) == 0 || strncmp(method, "-p", 2)==0){
         strncpy(buffer+idx, "POST", 4);
         idx += 4;
     }
@@ -79,6 +80,21 @@ int build_http_request(char ** message, int *size, char * method, char * path, c
     buffer[idx++] = '\r';
     buffer[idx++] = '\n';
 
+    //Content-Length
+    tbuf = "Content-Length: ";
+    tlen = strlen(tbuf);
+    strncpy(buffer+idx, tbuf, tlen);
+    idx += tlen;
+
+    sprintf(sbuf, "%d", clength);
+    tlen = strlen(sbuf);
+    strncpy(buffer+idx, sbuf, tlen);
+    idx += tlen;
+
+    buffer[idx++] = '\r';
+    buffer[idx++] = '\n';
+
+
     //End of headers 
     buffer[idx++] = '\r';
     buffer[idx++] = '\n';
@@ -98,11 +114,13 @@ int parse_url(const char * url, char ** hostname, char ** port, char ** path){
     int path_idx;
 
     int url_size = strlen(url);
+    /*
     if(strncmp(url, "http://", 7) != 0){
         printf("parse_url : must start with 'http://'\n");
         return -1;
     }
-    hname_idx = 7;
+    */
+    hname_idx = 0;
 
     for(port_idx = hname_idx; port_idx < url_size; port_idx++){
         if(url[port_idx] == ':'){
@@ -148,7 +166,7 @@ int parse_url(const char * url, char ** hostname, char ** port, char ** path){
 
 int main(int argc, char * argv[]){
     int sockfd, numbytes;
-    char buf[MAXDATASIZE];
+    char buf[CHUNKSIZE];
     struct addrinfo hints, *servinfo, *p;
     int rv;
  
@@ -160,6 +178,13 @@ int main(int argc, char * argv[]){
     char * message;
     int msize;
 
+    /*
+    char st[10];
+    printf("greetings!\n");
+    sprintf(st, "%d\n", 10);
+    printf("%s", st);
+*/
+
     if(argc != 3){
         fprintf(stderr, "usage: ./client -[G|P] url\n");
         exit(1);
@@ -169,10 +194,10 @@ int main(int argc, char * argv[]){
     if(parse_url(argv[2], &hostname, &port, &path) == -1){
         printf("Incorrect URL: %s\n", argv[2]);
         exit(1);
-    } 
+    }
 
-    //build HTTP request
-    if(build_http_request(&message, &msize, argv[1], path, hostname, port, "") == -1){
+    //build HTTP request (w/o content)
+    if(build_http_request(&message, &msize, argv[1], path, hostname, port, 0) == -1){
         printf("HTTP request build error\n");
         exit(1);
     }
@@ -216,7 +241,7 @@ int main(int argc, char * argv[]){
         perror("send");
     }
 
-    if((numbytes = recv(sockfd, buf, MAXDATASIZE-1, 0)) == -1){
+    if((numbytes = recv(sockfd, buf, CHUNKSIZE-1, 0)) == -1){
         perror("recv");
         exit(1);
     }
