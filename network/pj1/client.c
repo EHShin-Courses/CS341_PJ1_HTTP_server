@@ -7,13 +7,21 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
 #define PORT "9034"
 
-#define CHUNKSIZE 100
+#define CHUNKSIZE 1024
+
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+
+#define TEMP_PATH "./temptemptem"
+
+enum method {GET, POST};
 
 void *get_in_addr(struct sockaddr *sa){
     if(sa->sa_family == AF_INET){
@@ -22,7 +30,48 @@ void *get_in_addr(struct sockaddr *sa){
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int build_http_request(char ** message, int *size, char * method, char * path, char * host, char * port, int clength){
+int parse_http_response(char * buf, int resp_bytes, int * clength, int * cidx){
+    // information to extract:
+    //      content length (if exists)
+    //      content start idx (if exists)
+    int idx = 0;
+    int newLine = 1;
+    *cidx = -1;
+    int clidx = -1;
+    char * uu;
+    while(idx < resp_bytes){
+        if(newLine){
+            newLine = 0;
+
+            //look for end of header
+            if(strncmp(buf+idx, "\r\n", 2) == 0){
+                *cidx = idx+2;
+                break;
+            }
+
+            //look for content-length
+            if(strncmp(buf+idx, "Content-Length: ",16) == 0){
+                clidx = idx + 16;
+            }
+        }
+
+        if(buf[idx] == '\r'){
+            idx++;
+            newLine = 1;
+        }
+        idx++;
+    }
+    if(clidx == -1){
+        *clength = -1;
+    }
+    else{
+        *clength = strtol(buf+clidx, &uu, 10);
+    }
+    return 0;
+}
+
+
+int build_http_request(char ** message, int *size, enum method mthd, char * path, char * host, char * port, int clength){
     
     *size = 100+strlen(path); //rough size estimate
     char * buffer = (char *)malloc(*size);
@@ -33,11 +82,11 @@ int build_http_request(char ** message, int *size, char * method, char * path, c
     int idx = 0;
 
     //method
-    if(strncmp(method, "-G", 2) == 0 || strncmp(method, "-g", 2) == 0){
+    if(mthd == GET){
         strncpy(buffer+idx, "GET", 3);
         idx += 3;
     }
-    else if(strncmp(method, "-P", 2) == 0 || strncmp(method, "-p", 2)==0){
+    else if(mthd == POST){
         strncpy(buffer+idx, "POST", 4);
         idx += 4;
     }
@@ -174,21 +223,29 @@ int main(int argc, char * argv[]){
     char * hostname;
     char * port;
     char * path;
-
     char * message;
     int msize;
-
-    /*
-    char st[10];
-    printf("greetings!\n");
-    sprintf(st, "%d\n", 10);
-    printf("%s", st);
-*/
+    int tempfd;
+    int numwrite;
+    long fsize;
 
     if(argc != 3){
-        fprintf(stderr, "usage: ./client -[G|P] url\n");
+        fprintf(stderr, "usage: ./client -[g|p] url\n");
         exit(1);
     }
+
+    enum method mthd;
+    if(strncmp(argv[1], "-G", 2) == 0 || strncmp(argv[1], "-g", 2) == 0){
+        mthd = GET;
+    }
+    else if(strncmp(argv[1], "-P", 2) == 0 || strncmp(argv[1], "-p", 2)==0){
+        mthd = POST;
+    }
+    else{
+        fprintf(stderr, "method must be -g or -p\n");
+        exit(1);
+    }
+
 
     //parse url
     if(parse_url(argv[2], &hostname, &port, &path) == -1){
@@ -196,14 +253,32 @@ int main(int argc, char * argv[]){
         exit(1);
     }
 
+    //make temporary file
+    fsize = 0;
+    if(mthd == POST){
+        tempfd = creat(TEMP_PATH, 0777);
+        while(1){
+            numbytes = read(STDIN_FILENO, buf, CHUNKSIZE);
+            if(numbytes == 0) break;
+            numwrite = write(tempfd, buf, numbytes);
+            if(numwrite != numbytes){
+                printf("write error!\n");
+                exit(1);
+            }
+            fsize += numwrite;
+        }
+        close(tempfd);
+    }
+
     //build HTTP request (w/o content)
-    if(build_http_request(&message, &msize, argv[1], path, hostname, port, 0) == -1){
+    if(build_http_request(&message, &msize, mthd, path, hostname, port, fsize) == -1){
         printf("HTTP request build error\n");
         exit(1);
     }
 
-    printf("message:\n%s\n", message);
+    //printf("message:\n%s\n", message);
 
+    //make connection
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -234,21 +309,52 @@ int main(int argc, char * argv[]){
     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr),
             s, sizeof s);
 
-    printf("client: connecting to %s\n", s);
+    //printf("client: connecting to %s\n", s);
     freeaddrinfo(servinfo);
-    //strncpy(buf, "Hello there!", sizeof(buf));
     if(send(sockfd, message, msize, 0) == -1){
         perror("send");
     }
-
-    if((numbytes = recv(sockfd, buf, CHUNKSIZE-1, 0)) == -1){
-        perror("recv");
-        exit(1);
+    //send content if necessary
+    if(mthd == POST){
+        tempfd = open(TEMP_PATH, 0);
+        while(1){
+            numbytes = read(tempfd, buf, CHUNKSIZE);
+            if(numbytes == 0) break;
+            if(send(sockfd, buf, numbytes, 0) == -1){
+                perror("sendcontent");
+            }
+        }
     }
 
+    int clength, cidx;
+    int total_recieved = 0;
+    int remainder;
+
+    //get content length in first recv, then loop
+    numbytes = recv(sockfd, buf, CHUNKSIZE, 0);
+    parse_http_response(buf, numbytes, &clength, &cidx);
+    //printf("numbytes:%d\nclength:%d\ncidx:%d\n", numbytes,clength,cidx);
+
+    remainder = numbytes - cidx;
+    if(remainder > 0){
+        write(STDOUT_FILENO, buf+cidx, remainder);
+    }
+
+    while(total_recieved < clength){
+        numbytes = recv(sockfd, buf, CHUNKSIZE, 0);
+        if(numbytes == 0) break; //end of data
+        write(STDOUT_FILENO, buf, numbytes);
+        total_recieved += numbytes;
+    }
+
+    /*
+    tempfd = open(TEMP_PATH, O_WRONLY|O_CREAT, 0777);
+    write(tempfd, buf, numbytes);
+    close(tempfd);
     buf[numbytes] = '\0';
-    printf("Data from server: %s\n", buf);
+    */
+
     close(sockfd);
-    printf("client: connection closed\n");
+    //printf("client: connection closed\n");
     return 0;
 }
