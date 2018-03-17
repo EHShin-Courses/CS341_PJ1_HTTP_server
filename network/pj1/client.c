@@ -96,7 +96,8 @@ int main(int argc, char * argv[]){
     if(parse_url(argv[2], &hostname, &port, &path) == -1){
         printf("Incorrect URL: %s\n", argv[2]);
     }
-    printf("%s\n%s\n%s\n", hostname, port, path);
+    
+    //printf("%s\n%s\n%s\n", hostname, port, path);
 
 
     //build HTTP request
