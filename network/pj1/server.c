@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 #define CHUNKSIZE 1024
@@ -18,6 +19,7 @@
 #define PORT "9034"
 
 enum method {GET, POST};
+enum resptype {OK, BADREQ, NOTFOUND};
 
 struct client_session{
     int initial;
@@ -26,14 +28,100 @@ struct client_session{
     enum method mthd;
     long objsize;
     long cursize;
+    int do_response;
+    enum resptype rtype;
     struct client_session * next;
 };
 
 struct client_session * cs_list;
 
+int parse_http_request(char * buf, int nbytes, struct client_session * cs){
+    int idx = 0;
+    int newLine = 1;
+    int clidx = -1;
+    int cidx, clength;
+    char * uu;
+    int pathidx = -1;
+    int in_path = 0;
+    struct stat file_stat;
+    cs->rtype = OK; //for now
+    //get method
+    if(strncmp(buf, "GET", 3) == 0){
+        cs->mthd = GET;
+    }
+    else if(strncmp(buf, "POST", 4) == 0){
+        cs->mthd = POST;
+    }
+    while(idx < nbytes){
+        //look for path
+        if(pathidx == -1 || in_path){
+            if(buf[idx] == ' '){
+                if(in_path){
+                    buf[idx] = '\0';
+                    in_path = 0;
+                }
+                else{
+                    pathidx = idx+1;
+                    in_path = 1;
+                }
+            }
+        }
+        if(newLine){
+            newLine = 0;
+            //look for header end
+            if(strncmp(buf+idx, "\r\n", 2) == 0){
+                cidx = idx + 2;
+                break;
+            }
+            //look for content-length
+            if(strncmp(buf+idx, "Content-Length: ",16) == 0){
+                clidx = idx + 16;
+            }
+        }
+        if(buf[idx] == '\r'){
+            idx++;
+            newLine = 1;
+        }
+        idx++;
+    }
+    if(clidx == -1 && cs->mthd == POST){
+        cs->rtype = BADREQ;
+    }
+    else{
+        cs->objsize = strtol(buf+clidx, &uu, 10);
+        //printf("clength:%ld\n", cs->objsize);
+    }
+    
 
+    if(pathidx == -1){
+        cs->rtype = BADREQ;
+        cs->file_fd = -1;
+    }
+    else{
+        //Open Associated File
+        if(cs->mthd == GET){
+            // GET : open readable
+            cs->file_fd = open(buf+pathidx, 0, O_RDONLY);
+            if(cs->file_fd <= -1){
+                cs->rtype = NOTFOUND;
+            }
+            else{
+                //get file size
+                fstat(cs->file_fd, &file_stat);
+                cs->objsize = file_stat.st_size;
+            }
+            //printf("req path:[%s]\n", buf+pathidx);
+        }
+        else{
+            // POST : open writable
+            
+        }
+    }
 
-int parse_http_request(){
+    if(cs->rtype != OK){
+        printf("BADRESP/NOTFOUND!\n");
+        cs->do_response = 1;
+    }
 
     return 0;
 }
@@ -44,6 +132,7 @@ struct client_session * add_session(int sock_fd){
     cs->initial = 1;
     cs->sock_fd = sock_fd;
     cs->cursize = 0;
+    cs->do_response = 0;
     cs->next = cs_list;
     cs_list = cs;
 }
@@ -61,7 +150,8 @@ int delete_session(struct client_session * cs, fd_set * masterp){
     // free all resources associated with a client session, and remove from list
     FD_CLR(cs->sock_fd, masterp);
     close(cs->sock_fd);
-    close(cs->file_fd);
+    if(cs->file_fd != -1)
+        close(cs->file_fd);
 
     struct client_session * prev;
     //list pointers...
@@ -84,15 +174,21 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
     
     if(cs->initial){
         cs->initial = 0;
+        nbytes = recv(cs->sock_fd, buf, CHUNKSIZE, 0);
+        
         // read and parse header
         // fields to setup:
-        // file_fd, mthd, objsize
-        // max_fd, master
-        //
-        // request error checking
-        //
+        // file_fd, mthd, objsize, do_response, rtype
+        parse_http_request(buf, nbytes, cs);
+
+        if(cs->file_fd != -1){
+            FD_SET(cs->file_fd, masterp);
+            if(cs->file_fd > *max_fd)
+                *max_fd = cs->file_fd;
+        }
+
     }else{
-        if(cs->mthd == POST){
+        if(cs->mthd == POST && (!(cs->do_response))){
             if(FD_ISSET(cs->sock_fd, read_fdsp)){
                 if(FD_ISSET(cs->file_fd, write_fdsp)){
                     // socket -> file ready
@@ -112,31 +208,49 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
             if(FD_ISSET(cs->sock_fd, write_fdsp)){
                 if(FD_ISSET(cs->file_fd, read_fdsp)){
                     // file -> socket ready
-                    remsize = cs->objsize - cs->cursize;
-                    if(remsize > CHUNKSIZE)
-                        remsize = CHUNKSIZE;
-                    nbytes = read(cs->file_fd, buf, remsize);
-                    if(nbytes != remsize){
-                        fprintf(stderr,"read from file: filesize mismatch!");
-                        exit(1);
+                    
+                    if(cs->do_response){
+                        
+                        //build response
+                        //TODO
+                        //send response
+                        
+                        if(cs->mthd == POST || cs->rtype != OK){
+                            //session finished
+                            delete_session(cs, masterp); 
+                        }
                     }
-                    nbytes = send(cs->sock_fd, buf, remsize, 0);
-                    if(nbytes == 0){
-                    // send 0 bytes means disconnection
-                        delete_session(cs, masterp);
-                        return 1;
+                    else{
+                        //send content
+                        remsize = cs->objsize - cs->cursize;
+                        if(remsize > CHUNKSIZE)
+                            remsize = CHUNKSIZE;
+                        nbytes = read(cs->file_fd, buf, remsize);
+                        if(nbytes != remsize){
+                            fprintf(stderr,"read from file: filesize mismatch!");
+                            exit(1);
+                        }
+                        nbytes = send(cs->sock_fd, buf, remsize, 0);
+                        if(nbytes == 0){
+                        // send 0 bytes means disconnection
+                            delete_session(cs, masterp);
+                            return 1;
+                        }
                     }
                 }
             }
         }
     }
     if(cs->objsize == cs->cursize){
-        //we are done with this session
         if(cs->mthd == POST){
             //send 200 OK
-
+            cs->rtype = OK;
+            cs->do_response = 1;
         }
-        delete_session(cs, masterp);
+        else{
+            //finished sending GET content
+            delete_session(cs, masterp);
+        }
     }
 }
 
