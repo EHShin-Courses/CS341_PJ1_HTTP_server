@@ -13,18 +13,131 @@
 #include <sys/wait.h>
 #include <signal.h>
 
+#define CHUNKSIZE 1024
+
 #define PORT "9034"
 
+enum method {GET, POST};
+
 struct client_session{
+    int initial;
     int sock_fd;
     int file_fd;
+    enum method mthd;
+    long objsize;
+    long cursize;
     struct client_session * next;
 };
 
 struct client_session * cs_list;
 
-void add_client_session(int sock_fd, int file_fd){
+
+
+int parse_http_request(){
+
+    return 0;
+}
+
+struct client_session * add_session(int sock_fd){
+    struct client_session * cs;
+    cs = (struct client_session *)malloc(sizeof(struct client_session));
+    cs->initial = 1;
+    cs->sock_fd = sock_fd;
+    cs->cursize = 0;
+    cs->next = cs_list;
+    cs_list = cs;
+}
+
+struct client_session * find_session(int fd){
+    struct client_session * cs;
+    for(cs = cs_list; cs != NULL; cs = cs->next){
+        if(cs->file_fd == fd || cs->sock_fd == fd)
+            return cs;
+    }
+    return NULL;
+}
+
+int delete_session(struct client_session * cs, fd_set * masterp){
+    // free all resources associated with a client session, and remove from list
+    FD_CLR(cs->sock_fd, masterp);
+    close(cs->sock_fd);
+    close(cs->file_fd);
+
+    struct client_session * prev;
+    //list pointers...
+    if(cs_list == cs)
+        cs_list = cs->next;
+    else{
+        for(prev = cs_list; prev != NULL; prev = prev->next){
+            if(prev->next == cs)
+                break;
+        }
+        prev->next = cs->next;
+    }
+    free(cs);
+}
+
+int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fdsp, fd_set *write_fdsp, int * max_fd){
+    char buf[CHUNKSIZE];
+    int remsize;
+    int nbytes;
     
+    if(cs->initial){
+        cs->initial = 0;
+        // read and parse header
+        // fields to setup:
+        // file_fd, mthd, objsize
+        // max_fd, master
+        //
+        // request error checking
+        //
+    }else{
+        if(cs->mthd == POST){
+            if(FD_ISSET(cs->sock_fd, read_fdsp)){
+                if(FD_ISSET(cs->file_fd, write_fdsp)){
+                    // socket -> file ready
+                    remsize = cs->objsize - cs->cursize;
+                    if(remsize > CHUNKSIZE)
+                        remsize = CHUNKSIZE;
+                    nbytes = recv(cs->sock_fd, buf, remsize, 0);                
+                    if(nbytes == 0){
+                    // recv 0 bytes means disconnection
+                        delete_session(cs, masterp);
+                        return 1;
+                    }
+                    write(cs->file_fd, buf, nbytes);
+                }
+            }
+        }else{
+            if(FD_ISSET(cs->sock_fd, write_fdsp)){
+                if(FD_ISSET(cs->file_fd, read_fdsp)){
+                    // file -> socket ready
+                    remsize = cs->objsize - cs->cursize;
+                    if(remsize > CHUNKSIZE)
+                        remsize = CHUNKSIZE;
+                    nbytes = read(cs->file_fd, buf, remsize);
+                    if(nbytes != remsize){
+                        fprintf(stderr,"read from file: filesize mismatch!");
+                        exit(1);
+                    }
+                    nbytes = send(cs->sock_fd, buf, remsize, 0);
+                    if(nbytes == 0){
+                    // send 0 bytes means disconnection
+                        delete_session(cs, masterp);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    if(cs->objsize == cs->cursize){
+        //we are done with this session
+        if(cs->mthd == POST){
+            //send 200 OK
+
+        }
+        delete_session(cs, masterp);
+    }
 }
 
 void *get_in_addr(struct sockaddr *sa){
@@ -34,122 +147,109 @@ void *get_in_addr(struct sockaddr *sa){
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int main(int argc, char ** argv){
-
-    fd_set master;
-    fd_set read_fds;
-    int fdmax;
-
-    int listener;
-    int newfd;
-    struct sockaddr_storage remoteaddr;
-    socklen_t addrlen;
-
-    char buf[256];
-    int nbytes;
-
-    char remoteIP[INET6_ADDRSTRLEN];
-
-    int yes=1;
-    int i, j, rv;
+int setup_listener(){
 
     struct addrinfo hints, *ai, *p;
+    int rv, listener;
+    int yes=1;
 
-    FD_ZERO(&master);
-    FD_ZERO(&read_fds);
-
+    //setup listener
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-
     if((rv = getaddrinfo(NULL, PORT, &hints, &ai)) != 0){
         fprintf(stderr, "selectserver: %s\n", gai_strerror(rv));
         exit(1);
     }
-
     for(p = ai; p != NULL; p = p->ai_next){
         listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol); 
         if(listener < 0) continue;
-
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
-
         if(bind(listener, p->ai_addr, p->ai_addrlen)<0){
             close(listener);
             continue;
         }
         break;
     }
-
     if(p==NULL){
         fprintf(stderr, "selectserver: failed to bind\n");
         exit(2);
     }
-
     freeaddrinfo(ai);
-
     if(listen(listener, 10) == -1){
         perror("listen");
         exit(3);
     }
 
-    FD_SET(listener, &master);
+    return listener;
+}
 
+
+int main(int argc, char ** argv){
+
+    fd_set master;
+    fd_set read_fds;
+    fd_set write_fds;
+
+    int fdmax;
+    int listener;
+    int newfd;
+    struct sockaddr_storage remoteaddr;
+    socklen_t addrlen;
+    char buf[256];
+    int nbytes;
+
+    char remoteIP[INET6_ADDRSTRLEN];
+
+    int i;
+
+    struct client_session * cs;
+    struct client_session * nextcs;
+
+    //initialization
+    cs_list = NULL;
+    FD_ZERO(&master);
+    FD_ZERO(&read_fds);
+    FD_ZERO(&write_fds);
+
+    listener = setup_listener();
+    FD_SET(listener, &master);
     fdmax = listener;
 
+    //main loop
     for(;;){
+        //copy set
         read_fds = master;
-        if(select(fdmax+1, &read_fds, NULL, NULL, NULL) == -1){
+        write_fds = master;
+
+        if(select(fdmax+1, &read_fds, &write_fds, NULL, NULL) == -1){
             perror("select");
             exit(4);
         }
-        for(i=0; i<=fdmax; i++){
-            if(FD_ISSET(i, &read_fds)){
-                if(i==listener){
-                    //new client
-                    addrlen = sizeof remoteaddr;
-                    newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);
-                    
-                    if(newfd == -1){
-                        perror("accept");
-                    }else{
-                        FD_SET(newfd, &master);
-                        if(newfd > fdmax){
-                            fdmax = newfd;
-                        }
-                        printf("selectserver: new connection from %s on socket %d\n",
-                                inet_ntop(remoteaddr.ss_family,
-                                    get_in_addr((struct sockaddr*)&remoteaddr),
-                                    remoteIP, INET6_ADDRSTRLEN),
-                                newfd);
-                    }
-                }else{
-                    //handle client
-                    if((nbytes = recv(i, buf, sizeof buf, 0)) <= 0){
-                        if(nbytes == 0){
-                            //connection closed
-                            printf("selectserver: socket %d hung up\n", i);
-                        }
-                        else{
-                            perror("recv");
-                        }
-                        close(i);
-                        FD_CLR(i, &master);
-                    }
-                    else{
-                        //got data from client
-                        printf("Data from client: %s\n", buf);
 
-                        //send data to client
-                        strncpy(buf, "Greetings from server!", sizeof buf);
-                        if(send(i, buf, 256, 0) == -1){
-                            perror("send");
-                        }
-                    }
-                }
+        //check listener
+        if(FD_ISSET(listener, &read_fds)){
+            //new client
+            addrlen = sizeof remoteaddr;
+            newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);     
+            if(newfd == -1){
+               perror("accept");
+            }else{
+               FD_SET(newfd, &master);
+               if(newfd > fdmax){
+                   fdmax = newfd;
+               }
+               add_session(newfd);
             }
+
+        }
+
+        //traverse client sessions
+        for(cs = cs_list; cs != NULL; cs = nextcs){
+            nextcs = cs->next; // in case of cs deletion
+            handle_session(cs, &master, &read_fds, &write_fds, &fdmax);
         }
     }
-
     return 0;
 }
