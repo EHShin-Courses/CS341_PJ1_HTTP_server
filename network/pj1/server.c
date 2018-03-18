@@ -35,6 +35,35 @@ struct client_session{
 
 struct client_session * cs_list;
 
+int build_http_response(char ** message, int *msize, struct client_session * cs){
+    
+    char * buffer = (char *)malloc(128); // should be enough
+    if(cs->rtype == OK){
+        sprintf(buffer,
+                "HTTP/1.0 200 OK\r\n"
+                "Content-Length: %ld\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                cs->objsize);
+    }else if(cs->rtype == BADREQ){
+        sprintf(buffer,
+                "HTTP/1.0 400 Bad Request\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n"
+                "\r\n");
+    }else{
+        sprintf(buffer,
+                "HTTP/1.0 404 Not Found\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n"
+                "\r\n");
+    }
+    *msize = strlen(buffer);
+    *message = buffer;
+}
+
+
+
 int parse_http_request(char * buf, int nbytes, struct client_session * cs){
     int idx = 0;
     int newLine = 1;
@@ -102,24 +131,39 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
         if(cs->mthd == GET){
             // GET : open readable
             cs->file_fd = open(buf+pathidx, 0, O_RDONLY);
-            if(cs->file_fd <= -1){
+            if(cs->file_fd < 0){
                 cs->rtype = NOTFOUND;
+                cs->file_fd = -1;
             }
             else{
                 //get file size
                 fstat(cs->file_fd, &file_stat);
                 cs->objsize = file_stat.st_size;
+                if(S_ISDIR(file_stat.st_mode)){
+                    cs->rtype = BADREQ;
+                    close(cs->file_fd);
+                    cs->file_fd = -1;
+                }
             }
             //printf("req path:[%s]\n", buf+pathidx);
         }
         else{
-            // POST : open writable
-            
+            // POST : create writable
+            cs->file_fd = creat(buf+pathidx, 0777);
+            if(S_ISDIR(file_stat.st_mode)){
+                cs->rtype = BADREQ;
+                close(cs->file_fd);
+                cs->file_fd = -1;
+            }
+           if(cs->file_fd < 0){
+                cs->rtype = BADREQ;
+                cs->file_fd = -1;
+           }
         }
     }
 
     if(cs->rtype != OK){
-        printf("BADRESP/NOTFOUND!\n");
+        //printf("BADRESP/NOTFOUND!\n");
         cs->do_response = 1;
     }
 
@@ -150,8 +194,10 @@ int delete_session(struct client_session * cs, fd_set * masterp){
     // free all resources associated with a client session, and remove from list
     FD_CLR(cs->sock_fd, masterp);
     close(cs->sock_fd);
-    if(cs->file_fd != -1)
+    if(cs->file_fd != -1){
         close(cs->file_fd);
+        FD_CLR(cs->file_fd, masterp);
+    }
 
     struct client_session * prev;
     //list pointers...
@@ -171,6 +217,8 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
     char buf[CHUNKSIZE];
     int remsize;
     int nbytes;
+    int msize;
+    char * message;
     
     if(cs->initial){
         cs->initial = 0;
@@ -180,15 +228,20 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
         // fields to setup:
         // file_fd, mthd, objsize, do_response, rtype
         parse_http_request(buf, nbytes, cs);
-
-        if(cs->file_fd != -1){
-            FD_SET(cs->file_fd, masterp);
-            if(cs->file_fd > *max_fd)
-                *max_fd = cs->file_fd;
+        if(cs == NULL){
+            //session is over
+        }
+        else if(cs->file_fd != -1){
+            if(cs->rtype == OK){
+                FD_SET(cs->file_fd, masterp);
+                if(cs->file_fd > *max_fd)
+                   *max_fd = cs->file_fd;
+            }
         }
 
     }else{
         if(cs->mthd == POST && (!(cs->do_response))){
+            // must recieve sth first
             if(FD_ISSET(cs->sock_fd, read_fdsp)){
                 if(FD_ISSET(cs->file_fd, write_fdsp)){
                     // socket -> file ready
@@ -205,44 +258,43 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                 }
             }
         }else{
+            // must send sth first
             if(FD_ISSET(cs->sock_fd, write_fdsp)){
-                if(FD_ISSET(cs->file_fd, read_fdsp)){
+                if(cs->do_response){
+                    //printf("will do response...\n");         
+                    build_http_response(&message, &msize, cs);
+                    send(cs->sock_fd, message, msize, 0);
+                    free(message);
+                    if(cs->mthd == POST || cs->rtype != OK){
+                        //session finished
+                        delete_session(cs, masterp); 
+                    }
+                }
+                else if(FD_ISSET(cs->file_fd, read_fdsp)){
                     // file -> socket ready
                     
-                    if(cs->do_response){
-                        
-                        //build response
-                        //TODO
-                        //send response
-                        
-                        if(cs->mthd == POST || cs->rtype != OK){
-                            //session finished
-                            delete_session(cs, masterp); 
-                        }
+                    //send content
+                    remsize = cs->objsize - cs->cursize;
+                    if(remsize > CHUNKSIZE)
+                        remsize = CHUNKSIZE;
+                    nbytes = read(cs->file_fd, buf, remsize);
+                    if(nbytes != remsize){
+                        printf("filesize mismatch!\n");
+                        return 1;
                     }
-                    else{
-                        //send content
-                        remsize = cs->objsize - cs->cursize;
-                        if(remsize > CHUNKSIZE)
-                            remsize = CHUNKSIZE;
-                        nbytes = read(cs->file_fd, buf, remsize);
-                        if(nbytes != remsize){
-                            fprintf(stderr,"read from file: filesize mismatch!");
-                            exit(1);
-                        }
-                        nbytes = send(cs->sock_fd, buf, remsize, 0);
-                        if(nbytes == 0){
-                        // send 0 bytes means disconnection
-                            delete_session(cs, masterp);
-                            return 1;
-                        }
+                    nbytes = send(cs->sock_fd, buf, remsize, 0);
+                    if(nbytes == 0){
+                    // send 0 bytes means disconnection
+                        delete_session(cs, masterp);
+                        return 1;
                     }
                 }
             }
         }
     }
-    if(cs->objsize == cs->cursize){
+    if((!(cs->do_response)) && cs->objsize == cs->cursize){
         if(cs->mthd == POST){
+            //finished receiving POST content
             //send 200 OK
             cs->rtype = OK;
             cs->do_response = 1;

@@ -332,8 +332,12 @@ int main(int argc, char * argv[]){
 
     //get content length in first recv, then loop
     numbytes = recv(sockfd, buf, CHUNKSIZE, 0);
+
+    buf[numbytes] = '\0';
+    printf("response bytes:%d\n", numbytes);
+    printf("response from server:\n%s\n", buf);
+    
     parse_http_response(buf, numbytes, &clength, &cidx);
-    //printf("numbytes:%d\nclength:%d\ncidx:%d\n", numbytes,clength,cidx);
 
     remainder = numbytes - cidx;
     if(remainder > 0){
@@ -347,14 +351,6 @@ int main(int argc, char * argv[]){
         total_recieved += numbytes;
     }
 
-    /*
-    tempfd = open(TEMP_PATH, O_WRONLY|O_CREAT, 0777);
-    write(tempfd, buf, numbytes);
-    close(tempfd);
-    buf[numbytes] = '\0';
-    */
-
     close(sockfd);
-    //printf("client: connection closed\n");
     return 0;
 }
