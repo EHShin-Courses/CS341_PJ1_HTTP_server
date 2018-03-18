@@ -334,8 +334,6 @@ int main(int argc, char * argv[]){
     numbytes = recv(sockfd, buf, CHUNKSIZE, 0);
 
     buf[numbytes] = '\0';
-    printf("response bytes:%d\n", numbytes);
-    printf("response from server:\n%s\n", buf);
     
     parse_http_response(buf, numbytes, &clength, &cidx);
 
@@ -350,7 +348,9 @@ int main(int argc, char * argv[]){
         write(STDOUT_FILENO, buf, numbytes);
         total_recieved += numbytes;
     }
-
     close(sockfd);
+
+    remove(TEMP_PATH);
+
     return 0;
 }

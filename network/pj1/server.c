@@ -38,13 +38,18 @@ struct client_session * cs_list;
 int build_http_response(char ** message, int *msize, struct client_session * cs){
     
     char * buffer = (char *)malloc(128); // should be enough
+    long int clength;
+    if(cs->mthd == POST)
+        clength = 0;
+    else
+        clength = cs->objsize;
     if(cs->rtype == OK){
         sprintf(buffer,
                 "HTTP/1.0 200 OK\r\n"
                 "Content-Length: %ld\r\n"
                 "Connection: close\r\n"
                 "\r\n",
-                cs->objsize);
+                clength);
     }else if(cs->rtype == BADREQ){
         sprintf(buffer,
                 "HTTP/1.0 400 Bad Request\r\n"
@@ -73,6 +78,7 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
     int pathidx = -1;
     int in_path = 0;
     struct stat file_stat;
+    int remainder;
     cs->rtype = OK; //for now
     //get method
     if(strncmp(buf, "GET", 3) == 0){
@@ -90,7 +96,8 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
                     in_path = 0;
                 }
                 else{
-                    pathidx = idx+1;
+                    buf[idx] = '.';
+                    pathidx = idx;
                     in_path = 1;
                 }
             }
@@ -159,10 +166,15 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
                 cs->rtype = BADREQ;
                 cs->file_fd = -1;
            }
+           //write data immediately after header  
+           remainder = nbytes - cidx;
+           if(remainder > 0 && cs->file_fd > 0){
+               write(cs->file_fd, buf+cidx, nbytes); 
+           }
         }
     }
 
-    if(cs->rtype != OK){
+    if(cs->mthd == GET || cs->rtype != OK){
         //printf("BADRESP/NOTFOUND!\n");
         cs->do_response = 1;
     }
@@ -228,10 +240,7 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
         // fields to setup:
         // file_fd, mthd, objsize, do_response, rtype
         parse_http_request(buf, nbytes, cs);
-        if(cs == NULL){
-            //session is over
-        }
-        else if(cs->file_fd != -1){
+        if(cs->file_fd != -1){
             if(cs->rtype == OK){
                 FD_SET(cs->file_fd, masterp);
                 if(cs->file_fd > *max_fd)
@@ -255,6 +264,7 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                         return 1;
                     }
                     write(cs->file_fd, buf, nbytes);
+                    cs->cursize += nbytes;
                 }
             }
         }else{
@@ -268,6 +278,10 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                     if(cs->mthd == POST || cs->rtype != OK){
                         //session finished
                         delete_session(cs, masterp); 
+                    }
+                    else{
+                        // new send data for GET
+                        cs->do_response = 0;
                     }
                 }
                 else if(FD_ISSET(cs->file_fd, read_fdsp)){
@@ -283,6 +297,7 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                         return 1;
                     }
                     nbytes = send(cs->sock_fd, buf, remsize, 0);
+                    cs->cursize += nbytes;
                     if(nbytes == 0){
                     // send 0 bytes means disconnection
                         delete_session(cs, masterp);
