@@ -16,8 +16,6 @@
 
 #define CHUNKSIZE 1024
 
-#define PORT "9034"
-
 enum method {GET, POST};
 enum resptype {OK, BADREQ, NOTFOUND};
 
@@ -328,7 +326,7 @@ void *get_in_addr(struct sockaddr *sa){
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int setup_listener(){
+int setup_listener(const char * port){
 
     struct addrinfo hints, *ai, *p;
     int rv, listener;
@@ -339,7 +337,7 @@ int setup_listener(){
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    if((rv = getaddrinfo(NULL, PORT, &hints, &ai)) != 0){
+    if((rv = getaddrinfo(NULL, port, &hints, &ai)) != 0){
         fprintf(stderr, "selectserver: %s\n", gai_strerror(rv));
         exit(1);
     }
@@ -388,13 +386,14 @@ int main(int argc, char ** argv){
     struct client_session * cs;
     struct client_session * nextcs;
 
+
     //initialization
     cs_list = NULL;
     FD_ZERO(&master);
     FD_ZERO(&read_fds);
     FD_ZERO(&write_fds);
 
-    listener = setup_listener();
+    listener = setup_listener(argv[2]);
     FD_SET(listener, &master);
     fdmax = listener;
 
