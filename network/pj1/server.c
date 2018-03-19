@@ -63,6 +63,8 @@ int build_http_response(char ** message, int *msize, struct client_session * cs)
     }
     *msize = strlen(buffer);
     *message = buffer;
+
+    return 0;
 }
 
 
@@ -189,6 +191,7 @@ struct client_session * add_session(int sock_fd){
     cs->do_response = 0;
     cs->next = cs_list;
     cs_list = cs;
+    return cs;
 }
 
 struct client_session * find_session(int fd){
@@ -221,6 +224,7 @@ int delete_session(struct client_session * cs, fd_set * masterp){
         prev->next = cs->next;
     }
     free(cs);
+    return 0;
 }
 
 int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fdsp, fd_set *write_fdsp, int * max_fd){
@@ -317,6 +321,7 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
             delete_session(cs, masterp);
         }
     }
+    return 0;
 }
 
 void *get_in_addr(struct sockaddr *sa){
