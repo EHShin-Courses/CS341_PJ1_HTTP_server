@@ -19,6 +19,15 @@
 enum method {GET, POST};
 enum resptype {OK, BADREQ, NOTFOUND};
 
+/* for storing http request parse state */
+struct parse_state{
+    char line_buffer[64]; //buffer for single header line
+    int lb_idx; //buffer index of next byte
+    char * path;
+    int found_cl;
+};
+
+/* one for each client connection */
 struct client_session{
     int initial;
     int sock_fd;
@@ -28,6 +37,7 @@ struct client_session{
     long cursize;
     int do_response;
     enum resptype rtype;
+    struct parse_state * ps;
     struct client_session * next;
 };
 
@@ -68,6 +78,164 @@ int build_http_response(char ** message, int *msize, struct client_session * cs)
 }
 
 
+int parse_atmt(char * data, int recvbytes, struct client_session * cs){
+
+    int data_idx;
+    char c;
+    char * lb;
+    struct parse_state * ps;
+    int header_end;
+    int i;
+    int path_idx;
+    int path_len;
+    char * uu;
+    int cidx;
+
+    if(cs->ps == NULL){
+        //initial bytes from client
+        cs->ps = (struct parse_state *)malloc(sizeof(struct parse_state));
+        if(cs->ps == NULL){
+            perror("malloc fail");
+            return -1;
+        }
+        cs->ps->lb_idx = 0;
+        cs->ps->path = NULL;
+        cs->ps->found_cl = 0;
+    }
+
+    ps = cs->ps;
+    lb = cs->ps->line_buffer;
+
+    for(data_idx = 0; data_idx < recvbytes; data_idx++){
+        //read byte by byte
+        c = data[data_idx];
+        lb[ps->lb_idx] = c;
+        if(c == '\n' && ps->lb_idx > 0){
+            if(lb[ps->lb_idx-1] == '\r'){
+                //end of line
+                if(ps->lb_idx == 1){
+                    //end of header
+                    cs->rtype = OK; //for now
+                    header_end = 1;
+                    break;
+                }
+                if(cs->ps->path == NULL){
+                    //this must be end of first line
+                    
+                    //extract method
+                    if(strncmp(lb, "GET", 3) == 0){
+                        cs->mthd = GET;
+                    }
+                    else if(strncmp(lb, "POST", 4) == 0){
+                        cs->mthd = POST;
+                    } 
+                    else{
+                        cs->rtype = BADREQ;
+                        header_end = 1;
+                        break;
+                    }
+
+                    //extract path
+                    path_idx = -1;
+                    for(i=0; i <= ps->lb_idx; i++){
+                        if(lb[i]==' '){
+                            if(path_idx == -1){
+                                lb[i]='.';
+                                path_idx = i;
+                            }else{
+                                path_len = i - path_idx;
+                                break;
+                            }
+                        }
+                    }
+                    if(path_idx == -1){
+                        cs->rtype = BADREQ;
+                        header_end = 1;
+                        break;
+                    }
+                    else{
+                        ps->path = (char *)malloc(path_len+1);
+                        memcpy(ps->path, lb+path_idx, path_len);
+                        (ps->path)[path_len] = '\0';
+                    }
+                }
+                else if(cs->mthd == POST && ps->found_cl == 0){
+                    //look for content-length header
+                    if(strncmp(lb, "Content-Length: ", 16)==0){
+                        cs->objsize = strtol(lb+16, &uu, 10);
+                        ps->found_cl = 1;
+                    }
+                }
+                ps->lb_idx = -1; //reset line buffer
+            }
+        }
+        (ps->lb_idx)++;
+    }
+    if(header_end){
+        cs->initial = 0;
+        parse_tail(cs, data, data_idx, recvbytes - data_idx -1);
+    }
+    //header is not yet finished
+    return 0;
+}
+
+/* called when request header parsing is complete */
+int parse_tail(struct client_session * cs, char * data, int cidx, int remainder){
+
+    struct stat file_stat; 
+    // check additional bad request conditions
+    if(cs->rtype != BADREQ){
+        if(cs->mthd == POST && cs->ps->found_cl == 0){
+            cs->rtype = BADREQ;
+        }
+    }
+    if(cs->rtype == BADREQ){
+        cs->file_fd = -1;
+        cs->do_response = 1;
+        return 0;
+    }
+    else{
+        // Open associated file
+        if(cs->mthd == GET){
+            // GET : open readable
+            cs->file_fd = open(cs->ps->path, 0, O_RDONLY);
+            if(cs->file_fd < 0){
+                cs->rtype = NOTFOUND;
+                cs->do_response = 1;
+                return 0;
+            }
+            //get file size
+            fstat(cs->file_fd, &file_stat);
+            cs->objsize = file_stat.st_size;
+            if(S_ISDIR(file_stat.st_mode)){
+                //don't give directory
+                cs->rtype = BADREQ;
+                close(cs->file_fd);
+                cs->file_fd = -1;
+                cs->do_response = 1;
+                return 0;
+            }
+        }
+        else{
+            // POST : create writable
+            cs->file_fd  = creat(cs->ps->path, 0777);
+            if(cs->file_fd < 0){
+                cs->rtype = BADREQ;
+                cs->do_response = 1;
+                return 0;
+            }
+            //write remaining data
+            if(remainder > 0){
+                printf("there is remainder!\n");
+                write(cs->file_fd, data+cidx, remainder);
+            }
+        }
+    }
+    if(cs->mthd == GET){
+        cs->do_response = 1;
+    }
+    return 0;
+}
 
 int parse_http_request(char * buf, int nbytes, struct client_session * cs){
     int idx = 0;
@@ -129,6 +297,8 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
     }
     
 
+    // Action according to parse result
+    //
     if(pathidx == -1){
         cs->rtype = BADREQ;
         cs->file_fd = -1;
@@ -175,7 +345,6 @@ int parse_http_request(char * buf, int nbytes, struct client_session * cs){
     }
 
     if(cs->mthd == GET || cs->rtype != OK){
-        //printf("BADRESP/NOTFOUND!\n");
         cs->do_response = 1;
     }
 
@@ -192,15 +361,6 @@ struct client_session * add_session(int sock_fd){
     cs->next = cs_list;
     cs_list = cs;
     return cs;
-}
-
-struct client_session * find_session(int fd){
-    struct client_session * cs;
-    for(cs = cs_list; cs != NULL; cs = cs->next){
-        if(cs->file_fd == fd || cs->sock_fd == fd)
-            return cs;
-    }
-    return NULL;
 }
 
 int delete_session(struct client_session * cs, fd_set * masterp){
@@ -235,14 +395,20 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
     char * message;
     
     if(cs->initial){
-        cs->initial = 0;
         nbytes = recv(cs->sock_fd, buf, CHUNKSIZE, 0);
+        if(nbytes < 0){
+            if(errno != EWOULDBLOCK){
+                perror("intial recv");
+            }
+            return 0;
+        }
+        parse_atmt(buf, nbytes, cs); 
         
         // read and parse header
         // fields to setup:
         // file_fd, mthd, objsize, do_response, rtype
         parse_http_request(buf, nbytes, cs);
-        if(cs->file_fd != -1){
+        if(cs->initial == 0 && cs->file_fd != -1){
             if(cs->rtype == OK){
                 FD_SET(cs->file_fd, masterp);
                 if(cs->file_fd > *max_fd)
@@ -260,6 +426,14 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                     if(remsize > CHUNKSIZE)
                         remsize = CHUNKSIZE;
                     nbytes = recv(cs->sock_fd, buf, remsize, 0);                
+
+                    if(nbytes < 0){
+                      if(errno != EWOULDBLOCK){
+                        perror("post recv");
+                      }
+                      return 0;
+                    } 
+
                     if(nbytes == 0){
                     // recv 0 bytes means disconnection
                         delete_session(cs, masterp);
@@ -275,7 +449,15 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                 if(cs->do_response){
                     //printf("will do response...\n");         
                     build_http_response(&message, &msize, cs);
-                    send(cs->sock_fd, message, msize, 0);
+                    nbytes = send(cs->sock_fd, message, msize, 0);
+         
+                    if(nbytes < 0){
+                        if(errno != EWOULDBLOCK){
+                            perror("send response");
+                        }
+                        return 0;
+                    } 
+         
                     free(message);
                     if(cs->mthd == POST || cs->rtype != OK){
                         //session finished
@@ -299,6 +481,13 @@ int handle_session(struct client_session * cs, fd_set *masterp, fd_set *read_fds
                         return 1;
                     }
                     nbytes = send(cs->sock_fd, buf, remsize, 0);
+                    if(nbytes < 0){
+                         if(errno != EWOULDBLOCK){
+                            perror("get send");
+                         }
+                         return 0;
+                    } 
+
                     cs->cursize += nbytes;
                     if(nbytes == 0){
                     // send 0 bytes means disconnection
@@ -350,6 +539,12 @@ int setup_listener(const char * port){
         listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol); 
         if(listener < 0) continue;
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+        int flags = fcntl(listener, F_GETFL, 0);
+        int rc = fcntl(listener, F_SETFL, flags|O_NONBLOCK);
+        if(rc<0){
+            close(listener);
+            continue;
+        }
         if(bind(listener, p->ai_addr, p->ai_addrlen)<0){
             close(listener);
             continue;
@@ -365,7 +560,6 @@ int setup_listener(const char * port){
         perror("listen");
         exit(3);
     }
-
     return listener;
 }
 
@@ -417,17 +611,21 @@ int main(int argc, char ** argv){
         if(FD_ISSET(listener, &read_fds)){
             //new client
             addrlen = sizeof remoteaddr;
-            newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);     
-            if(newfd == -1){
-               perror("accept");
-            }else{
-               FD_SET(newfd, &master);
-               if(newfd > fdmax){
+            do{
+                newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);     
+                if(newfd < 0){
+                    if(errno != EWOULDBLOCK){
+                        perror("accept() fail");
+                        exit(-1);
+                    }
+                    break;
+                }
+                FD_SET(newfd, &master);
+                if(newfd > fdmax){
                    fdmax = newfd;
-               }
-               add_session(newfd);
-            }
-
+                }
+                add_session(newfd);
+            }while(newfd >= 0);
         }
 
         //traverse client sessions
