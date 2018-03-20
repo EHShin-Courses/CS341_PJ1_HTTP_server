@@ -6,5 +6,8 @@ server: server.c
 client: client.c
 	gcc -g client.c -o client
 
+testclient: testclient.c
+	gcc -g testclient.c -o testclient
+
 clean:
 	rm -f client server
