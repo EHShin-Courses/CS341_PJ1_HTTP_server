@@ -199,6 +199,7 @@ int parse_tail(struct client_session * cs, char * data, int cidx, int remainder)
         if(cs->mthd == GET){
             // GET : open readable
             cs->file_fd = open(cs->ps->path, 0, O_RDONLY);
+            free(cs->ps->path);
             if(cs->file_fd < 0){
                 cs->rtype = NOTFOUND;
                 cs->do_response = 1;
@@ -259,6 +260,7 @@ int delete_session(struct client_session * cs, fd_set * masterp){
         FD_CLR(cs->file_fd, masterp);
     }
 
+    free(cs->ps);
     struct client_session * prev;
     //list pointers...
     if(cs_list == cs)
